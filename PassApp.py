@@ -1,4 +1,4 @@
-import streamlit as st
+from flask import Flask, request, render_template, redirect, url_for, flash, session
 import sqlite3
 import hashlib
 import secrets
@@ -8,23 +8,31 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 import base64
 import os
-import pandas as pd
-from datetime import datetime
+from google.auth.transport.requests import Request
+from google.oauth2.credentials import Credentials
+from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.discovery import build
+from googleapiclient.http import MediaFileUpload, MediaIoBaseDownload
+import io
+import json
+import pyperclip
 
+app = Flask(__name__)
+app.secret_key = os.urandom(24)
 
 class PasswordManager:
     def __init__(self):
         self.master_key = None
         self.cipher_suite = None
         self.db_file = "passwords.db"
+        self.download_db_from_drive()
         self.setup_database()
+        self.upload_db_to_drive()
 
     def setup_database(self):
-        """Initialize the database"""
         try:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
-
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS master_password (
                     id INTEGER PRIMARY KEY,
@@ -32,7 +40,6 @@ class PasswordManager:
                     salt TEXT NOT NULL
                 )
             ''')
-
             cursor.execute('''
                 CREATE TABLE IF NOT EXISTS passwords (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,15 +50,13 @@ class PasswordManager:
                     created_date TIMESTAMP DEFAULT CURRENT_TIMESTAMP
                 )
             ''')
-
             conn.commit()
         except sqlite3.Error as e:
-            st.error(f"Database error: {e}")
+            print(f"Database error: {e}")
         finally:
             conn.close()
 
     def derive_key(self, password, salt):
-        """Derive encryption key from master password"""
         password = password.encode()
         kdf = PBKDF2HMAC(
             algorithm=hashes.SHA256(),
@@ -63,56 +68,48 @@ class PasswordManager:
         return key
 
     def set_master_password(self, password):
-        """Set and store master password"""
         try:
             salt = os.urandom(16)
             password_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             cursor.execute('DELETE FROM master_password')
             cursor.execute('INSERT INTO master_password (id, password_hash, salt) VALUES (?, ?, ?)',
                            (1, base64.b64encode(password_hash).decode(), base64.b64encode(salt).decode()))
             conn.commit()
-
             self.master_key = self.derive_key(password, salt)
             self.cipher_suite = Fernet(self.master_key)
+            self.upload_db_to_drive()
             return True
         except Exception as e:
-            st.error(f"Error setting master password: {e}")
+            print(f"Error setting master password: {e}")
             return False
         finally:
             conn.close()
 
     def verify_master_password(self, password):
-        """Verify master password and set up encryption"""
         try:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             cursor.execute('SELECT password_hash, salt FROM master_password WHERE id=1')
             result = cursor.fetchone()
-
             if not result:
                 return False
-
             stored_hash = base64.b64decode(result[0])
             salt = base64.b64decode(result[1])
-
             password_hash = hashlib.pbkdf2_hmac('sha256', password.encode(), salt, 100000)
-
             if password_hash == stored_hash:
                 self.master_key = self.derive_key(password, salt)
                 self.cipher_suite = Fernet(self.master_key)
                 return True
             return False
         except Exception as e:
-            st.error(f"Error verifying master password: {e}")
+            print(f"Error verifying master password: {e}")
             return False
         finally:
             conn.close()
 
     def has_master_password(self):
-        """Check if master password exists"""
         try:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
@@ -120,28 +117,24 @@ class PasswordManager:
             count = cursor.fetchone()[0]
             return count > 0
         except sqlite3.Error as e:
-            st.error(f"Database error: {e}")
+            print(f"Database error in has_master_password: {e}")
             return False
         finally:
             conn.close()
 
     def encrypt_password(self, password):
-        """Encrypt password"""
         return self.cipher_suite.encrypt(password.encode()).decode()
 
     def decrypt_password(self, encrypted_password):
-        """Decrypt password"""
         try:
             return self.cipher_suite.decrypt(encrypted_password.encode()).decode()
         except Exception as e:
-            st.error(f"Decryption error: {e}")
+            print(f"Decryption error: {e}")
             return "DECRYPTION ERROR"
 
     def add_password(self, site_name, username, password, notes=""):
-        """Add new password entry"""
         try:
             encrypted_password = self.encrypt_password(password)
-
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             cursor.execute('''
@@ -149,21 +142,20 @@ class PasswordManager:
                 VALUES (?, ?, ?, ?)
             ''', (site_name, username, encrypted_password, notes))
             conn.commit()
+            self.upload_db_to_drive()
             return True
         except Exception as e:
-            st.error(f"Error adding password: {e}")
+            print(f"Error adding password: {e}")
             return False
         finally:
             conn.close()
 
     def get_all_passwords(self):
-        """Get all password entries"""
         try:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             cursor.execute('SELECT id, site_name, username, password, notes, created_date FROM passwords')
             results = cursor.fetchall()
-
             decrypted_results = []
             for row in results:
                 decrypted_password = self.decrypt_password(row[3])
@@ -172,16 +164,14 @@ class PasswordManager:
                 decrypted_results.append(decrypted_row)
             return decrypted_results
         except Exception as e:
-            st.error(f"Error getting passwords: {e}")
+            print(f"Error getting passwords: {e}")
             return []
         finally:
             conn.close()
 
     def update_password(self, password_id, site_name, username, password, notes=""):
-        """Update existing password entry"""
         try:
             encrypted_password = self.encrypt_password(password)
-
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             cursor.execute('''
@@ -189,213 +179,213 @@ class PasswordManager:
                 WHERE id=?
             ''', (site_name, username, encrypted_password, notes, password_id))
             conn.commit()
+            self.upload_db_to_drive()
             return True
         except Exception as e:
-            st.error(f"Error updating password: {e}")
+            print(f"Error updating password: {e}")
             return False
         finally:
             conn.close()
 
     def delete_password(self, password_id):
-        """Delete password entry"""
         try:
             conn = sqlite3.connect(self.db_file)
             cursor = conn.cursor()
             cursor.execute('DELETE FROM passwords WHERE id=?', (password_id,))
             conn.commit()
+            self.upload_db_to_drive()
             return True
         except Exception as e:
-            st.error(f"Error deleting password: {e}")
+            print(f"Error deleting password: {e}")
             return False
         finally:
             conn.close()
 
     def generate_password(self, length=16, include_symbols=True):
-        """Generate a secure random password"""
         characters = string.ascii_letters + string.digits
         if include_symbols:
             characters += "!@#$%^&*()_+-=[]{}|;:,.<>?"
         return ''.join(secrets.choice(characters) for _ in range(length))
 
+    def authenticate_drive(self):
+        SCOPES = ["https://www.googleapis.com/auth/drive"]
+        creds = None
+        if os.environ.get("GOOGLE_CREDENTIALS"):
+            creds_dict = json.loads(os.environ["GOOGLE_CREDENTIALS"])
+            creds = Credentials.from_authorized_user_info(creds_dict, SCOPES)
+        if not creds or not creds.valid:
+            if creds and creds.expired and creds.refresh_token:
+                creds.refresh(Request())
+            else:
+                flow = InstalledAppFlow.from_client_config(
+                    json.loads(os.environ["GOOGLE_CLIENT_CONFIG"]), SCOPES
+                )
+                creds = flow.run_local_server(port=0)
+                os.environ["GOOGLE_CREDENTIALS"] = json.dumps({
+                    "token": creds.token,
+                    "refresh_token": creds.refresh_token,
+                    "token_uri": creds.token_uri,
+                    "client_id": creds.client_id,
+                    "client_secret": creds.client_secret,
+                    "scopes": creds.scopes
+                })
+        self.drive_service = build("drive", "v3", credentials=creds)
 
-def main():
-    st.set_page_config(page_title="🔐 Secure Password Manager", page_icon="🔐", layout="wide")
-    
-    # Initialize session state
-    if 'pm' not in st.session_state:
-        st.session_state.pm = PasswordManager()
-    if 'authenticated' not in st.session_state:
-        st.session_state.authenticated = False
-    if 'show_passwords' not in st.session_state:
-        st.session_state.show_passwords = {}
+    def upload_db_to_drive(self, folder_id="1cDIcBqdG3sXc0sD3ueaKoQI3AGZPtUdr"):
+        try:
+            if not hasattr(self, "drive_service"):
+                self.authenticate_drive()
+            file_metadata = {"name": "passwords.db", "parents": [folder_id]}
+            media = MediaFileUpload(self.db_file, mimetype="application/x-sqlite3")
+            existing_files = self.drive_service.files().list(
+                q=f"name='passwords.db' and '{folder_id}' in parents",
+                fields="files(id, name)"
+            ).execute().get("files", [])
+            if existing_files:
+                file_id = existing_files[0]["id"]
+                self.drive_service.files().update(fileId=file_id, media_body=media).execute()
+            else:
+                self.drive_service.files().create(body=file_metadata, media_body=media, fields="id").execute()
+        except Exception as e:
+            print(f"Error uploading database to Drive: {e}")
 
-    st.title("🔐 Secure Password Manager")
+    def download_db_from_drive(self, folder_id="1cDIcBqdG3sXc0sD3ueaKoQI3AGZPtUdr"):
+        try:
+            if not hasattr(self, "drive_service"):
+                self.authenticate_drive()
+            files = self.drive_service.files().list(
+                q=f"name='passwords.db' and '{folder_id}' in parents",
+                fields="files(id, name)"
+            ).execute().get("files", [])
+            if not files:
+                print("No passwords.db found in Drive folder")
+                return
+            file_id = files[0]["id"]
+            request = self.drive_service.files().get_media(fileId=file_id)
+            with open(self.db_file, "wb") as f:
+                downloader = MediaIoBaseDownload(f, request)
+                done = False
+                while not done:
+                    status, done = downloader.next_chunk()
+        except Exception as e:
+            print(f"Error downloading database from Drive: {e}")
 
-    # Authentication
-    if not st.session_state.authenticated:
-        if not st.session_state.pm.has_master_password():
-            st.header("Setup Master Password")
-            st.warning("⚠️ Please create a master password to secure your data")
-            
-            with st.form("setup_form"):
-                master_password = st.text_input("Master Password", type="password", help="At least 8 characters")
-                confirm_password = st.text_input("Confirm Password", type="password")
-                submitted = st.form_submit_button("Create Master Password")
-                
-                if submitted:
-                    if len(master_password) < 8:
-                        st.error("Master password must be at least 8 characters long!")
-                    elif master_password != confirm_password:
-                        st.error("Passwords do not match!")
-                    else:
-                        if st.session_state.pm.set_master_password(master_password):
-                            st.success("Master password created successfully!")
-                            st.session_state.authenticated = True
-                            st.rerun()
-                        else:
-                            st.error("Failed to create master password!")
-        else:
-            st.header("Login")
-            with st.form("login_form"):
-                master_password = st.text_input("Master Password", type="password")
-                submitted = st.form_submit_button("Login")
-                
-                if submitted:
-                    if st.session_state.pm.verify_master_password(master_password):
-                        st.session_state.authenticated = True
-                        st.rerun()
-                    else:
-                        st.error("Invalid master password!")
+pm = PasswordManager()
+
+@app.route('/')
+def index():
+    if not pm.has_master_password():
+        return redirect(url_for('setup'))
+    if 'authenticated' not in session:
+        return redirect(url_for('login'))
+    return redirect(url_for('dashboard'))
+
+@app.route('/setup', methods=['GET', 'POST'])
+def setup():
+    if pm.has_master_password():
+        return redirect(url_for('login'))
+    if request.method == 'POST':
+        password = request.form['password']
+        confirm = request.form['confirm']
+        if len(password) < 8:
+            flash("Password must be at least 8 characters")
+            return redirect(url_for('setup'))
+        if password != confirm:
+            flash("Passwords do not match")
+            return redirect(url_for('setup'))
+        if pm.set_master_password(password):
+            session['authenticated'] = True
+            flash("Master password set successfully")
+            return redirect(url_for('dashboard'))
+        flash("Failed to set master password")
+    return render_template('setup.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if 'authenticated' in session:
+        return redirect(url_for('dashboard'))
+    if request.method == 'POST':
+        password = request.form['password']
+        if pm.verify_master_password(password):
+            session['authenticated'] = True
+            return redirect(url_for('dashboard'))
+        flash("Invalid master password")
+    return render_template('login.html')
+
+@app.route('/dashboard')
+def dashboard():
+    if 'authenticated' not in session:
+        return redirect(url_for('login'))
+    passwords = pm.get_all_passwords()
+    return render_template('dashboard.html', passwords=passwords)
+
+@app.route('/add', methods=['GET', 'POST'])
+def add():
+    if 'authenticated' not in session:
+        return redirect(url_for('login'))
+    if request.method == 'POST':
+        site_name = request.form['site_name']
+        username = request.form['username']
+        password = request.form['password']
+        notes = request.form.get('notes', '')
+        if not site_name or not username or not password:
+            flash("All fields are required")
+            return redirect(url_for('add'))
+        if pm.add_password(site_name, username, password, notes):
+            flash("Password added successfully")
+            return redirect(url_for('dashboard'))
+        flash("Failed to add password")
+    return render_template('add.html')
+
+@app.route('/edit/<int:id>', methods=['GET', 'POST'])
+def edit(id):
+    if 'authenticated' not in session:
+        return redirect(url_for('login'))
+    passwords = pm.get_all_passwords()
+    password = next((p for p in passwords if p[0] == id), None)
+    if not password:
+        flash("Password not found")
+        return redirect(url_for('dashboard'))
+    if request.method == 'POST':
+        site_name = request.form['site_name']
+        username = request.form['username']
+        password = request.form['password']
+        notes = request.form.get('notes', '')
+        if not site_name or not username or not password:
+            flash("All fields are required")
+            return redirect(url_for('edit', id=id))
+        if pm.update_password(id, site_name, username, password, notes):
+            flash("Password updated successfully")
+            return redirect(url_for('dashboard'))
+        flash("Failed to update password")
+    return render_template('edit.html', password=password)
+
+@app.route('/delete/<int:id>')
+def delete(id):
+    if 'authenticated' not in session:
+        return redirect(url_for('login'))
+    if pm.delete_password(id):
+        flash("Password deleted successfully")
     else:
-        # Main application
-        col1, col2, col3 = st.columns([1, 1, 1])
-        
-        with col1:
-            if st.button("🚪 Logout"):
-                st.session_state.authenticated = False
-                st.session_state.show_passwords = {}
-                st.rerun()
-        
-        with col2:
-            if st.button("🎲 Generate Password"):
-                st.session_state.show_generator = True
-        
-        with col3:
-            if st.button("➕ Add Password"):
-                st.session_state.show_add_form = True
+        flash("Failed to delete password")
+    return redirect(url_for('dashboard'))
 
-        # Password Generator
-        if st.session_state.get('show_generator', False):
-            st.header("🎲 Password Generator")
-            col1, col2 = st.columns(2)
-            with col1:
-                length = st.slider("Password Length", 8, 32, 16)
-            with col2:
-                include_symbols = st.checkbox("Include Symbols", value=True)
-            
-            if st.button("Generate New Password"):
-                generated_password = st.session_state.pm.generate_password(length, include_symbols)
-                st.code(generated_password, language=None)
-                st.success("Password generated! You can copy it from above.")
-            
-            if st.button("Close Generator"):
-                st.session_state.show_generator = False
-                st.rerun()
+@app.route('/generate', methods=['GET', 'POST'])
+def generate():
+    if 'authenticated' not in session:
+        return redirect(url_for('login'))
+    if request.method == 'POST':
+        length = int(request.form.get('length', 16))
+        include_symbols = 'include_symbols' in request.form
+        password = pm.generate_password(length, include_symbols)
+        return render_template('generate.html', generated_password=password)
+    return render_template('generate.html', generated_password=None)
 
-        # Add Password Form
-        if st.session_state.get('show_add_form', False):
-            st.header("➕ Add New Password")
-            with st.form("add_password_form"):
-                site_name = st.text_input("Site Name*")
-                username = st.text_input("Username*")
-                password = st.text_input("Password*", type="password")
-                notes = st.text_area("Notes (optional)")
-                
-                col1, col2 = st.columns(2)
-                with col1:
-                    submitted = st.form_submit_button("Save Password")
-                with col2:
-                    cancel = st.form_submit_button("Cancel")
-                
-                if submitted:
-                    if site_name and username and password:
-                        if st.session_state.pm.add_password(site_name, username, password, notes):
-                            st.success("Password saved successfully!")
-                            st.session_state.show_add_form = False
-                            st.rerun()
-                        else:
-                            st.error("Failed to save password!")
-                    else:
-                        st.error("Please fill in all required fields!")
-                
-                if cancel:
-                    st.session_state.show_add_form = False
-                    st.rerun()
-
-        # Search
-        st.header("🔍 Your Passwords")
-        search_term = st.text_input("Search passwords...", placeholder="Search by site name, username, or notes")
-
-        # Display passwords
-        passwords = st.session_state.pm.get_all_passwords()
-        
-        if passwords:
-            # Filter passwords based on search
-            if search_term:
-                filtered_passwords = []
-                for password in passwords:
-                    if (search_term.lower() in password[1].lower() or 
-                        search_term.lower() in password[2].lower() or 
-                        (password[4] and search_term.lower() in password[4].lower())):
-                        filtered_passwords.append(password)
-                passwords = filtered_passwords
-
-            for password in passwords:
-                password_id, site_name, username, decrypted_password, notes, created_date = password
-                
-                with st.expander(f"🌐 {site_name} - {username}"):
-                    col1, col2, col3, col4 = st.columns([2, 2, 1, 1])
-                    
-                    with col1:
-                        st.text(f"Site: {site_name}")
-                        st.text(f"Username: {username}")
-                    
-                    with col2:
-                        if st.session_state.show_passwords.get(password_id, False):
-                            st.text(f"Password: {decrypted_password}")
-                            if st.button("🙈 Hide", key=f"hide_{password_id}"):
-                                st.session_state.show_passwords[password_id] = False
-                                st.rerun()
-                        else:
-                            st.text("Password: ************")
-                            if st.button("👁️ Show", key=f"show_{password_id}"):
-                                st.session_state.show_passwords[password_id] = True
-                                st.rerun()
-                    
-                    with col3:
-                        if st.button("📋 Copy", key=f"copy_{password_id}"):
-                            # Since we can't access clipboard directly in web apps,
-                            # we'll show the password for copying
-                            st.session_state.show_passwords[password_id] = True
-                            st.success("Password revealed for copying!")
-                            st.rerun()
-                    
-                    with col4:
-                        if st.button("🗑️ Delete", key=f"delete_{password_id}"):
-                            if st.session_state.pm.delete_password(password_id):
-                                st.success("Password deleted!")
-                                st.rerun()
-                            else:
-                                st.error("Failed to delete password!")
-                    
-                    if notes:
-                        st.text(f"Notes: {notes}")
-                    
-                    if created_date:
-                        st.text(f"Created: {created_date[:10]}")
-        else:
-            st.info("No passwords saved yet. Click 'Add Password' to get started!")
-
+@app.route('/logout')
+def logout():
+    session.pop('authenticated', None)
+    return redirect(url_for('login'))
 
 if __name__ == "__main__":
-    main()
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)
